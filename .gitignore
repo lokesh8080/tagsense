@@ -2,3 +2,7 @@ packages/
 *.zip
 __pycache__/
 .DS_Store
+src/
+packages/
+.aws-sam/
+samconfig.toml

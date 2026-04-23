@@ -1,80 +1,75 @@
 # TagSense — AI-Powered Retroactive Resource Tagging
 
-Deploy a single CloudFormation stack. Get a compliance report with AI-inferred tag recommendations. Review. Apply. Enforce.
-
-## Architecture
-
-```
-EventBridge (weekly) ──► Step Functions Pipeline
-                              │
-                    ┌─────────┼─────────────┐
-                    ▼         ▼             ▼
-               Discovery → Inference → Report + Enforce
-                    │         │             │
-                    └─────────┴──────┬──────┘
-                                     ▼
-                              S3 (results)
-                                     │
-                              SNS (notification)
-                                     │
-                              Human reviews CSV
-                                     │
-                              Apply Lambda (manual trigger)
-```
+Deploy with two commands. Get a compliance report with AI-inferred tag recommendations. Review. Apply. Enforce.
 
 ## Quick Start
 
 ```bash
-# Deploy
-aws cloudformation deploy \
-  --template-file template.yaml \
-  --stack-name tagsense \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    NotificationEmail=your-email@example.com \
-    ScheduleExpression="rate(7 days)"
+git clone https://github.com/lokesh8080/tagsense.git
+cd tagsense
+sam build
+sam deploy --guided
+```
 
-# Run on-demand
-aws stepfunctions start-execution \
-  --state-machine-arn <StateMachineArn from outputs> \
-  --input '{"region": "us-east-1"}'
+SAM handles everything — packages Lambda code, uploads to S3, deploys CloudFormation. No manual zipping or shell scripts.
 
-# After reviewing the CSV in S3, apply approved tags
-aws lambda invoke \
-  --function-name tagsense-apply \
-  --payload '{"run_id": "<run_id>", "dry_run": false}' \
-  response.json
+## Architecture
+
+```
+EventBridge / Manual Trigger
+        │
+  Step Functions Pipeline
+        │
+  Discovery Lambda ──► S3 (resource list as JSONL)
+        │
+  Distributed Map (Tiers 1-3, parallel, 40 concurrent)
+    ├── Worker Lambda (batch of 20 resources)
+    ├── Worker Lambda ...
+    └── Worker Lambda ...
+        │
+  Aggregator Lambda ──► S3 (merged results)
+        │
+  Bedrock Batch Inference (Tier 4, async, 50% cheaper)
+        │
+  Poller (wait loop until batch completes)
+        │
+  Report Lambda ──► S3 (CSV + Summary) ──► SNS notification
+        │
+  Enforce Lambda ──► S3 (Tag Policy + SCP templates)
 ```
 
 ## How It Works
 
-### 1. Discovery
-Scans all resources via Resource Groups Tagging API. Scores compliance against your tag policy. Outputs gap list.
+### 5 Inference Tiers — Accuracy Over Hype
 
-### 2. Inference (5 tiers — accuracy over hype)
-
-| Tier | Method | Accuracy | Cost |
-|------|--------|----------|------|
+| Tier | Method | Confidence | Cost |
+|------|--------|------------|------|
 | 1 | CloudFormation stack tags | ~99% | Free |
 | 2 | CloudTrail creator lookup | ~95% | Free |
-| 3 | Neighbor consensus (same VPC/subnet) | ~80% | Free |
-| 4 | Amazon Bedrock AI | ~60% | ~$0.01/resource |
+| 3 | Neighbor consensus (same VPC) | ~80% | Free |
+| 4 | Amazon Bedrock Batch AI | ~60-71% | ~$0.003/resource |
 | 5 | Manual flag + orphan detection | N/A | Free |
 
-Tiers run in order. Stops at first high-confidence match. AI is the last resort, not the first.
+Tiers run in order. Deterministic first, AI last. Stops at first high-confidence match.
 
-### 3. Report
-Generates:
-- **CSV** for human review (with Approve Y/N column)
-- **Summary** with compliance score and tier breakdown
-- **SNS notification** when ready
+### Report & Review
 
-### 4. Apply (manual trigger only)
-Reads the reviewed CSV. Only applies tags where `Approve = Y`. Full audit trail in S3.
+Generates a CSV with an `Approve (Y/N)` column for human review. No tags applied without explicit approval.
 
-**Dry-run by default.** Must explicitly pass `dry_run: false`.
+### Apply (manual trigger, dry-run default)
 
-### 5. Enforce
+```bash
+# Dry run
+aws lambda invoke --function-name tagsense-apply \
+  --payload '{"run_id": "<run_id>", "dry_run": true}' response.json
+
+# Apply approved tags
+aws lambda invoke --function-name tagsense-apply \
+  --payload '{"run_id": "<run_id>", "dry_run": false}' response.json
+```
+
+### Enforce
+
 Generates ready-to-deploy templates:
 - **Tag Policy** — enforce allowed values across the Organization
 - **SCP** — deny resource creation without required tags
@@ -82,12 +77,12 @@ Generates ready-to-deploy templates:
 
 ## Customization
 
-Edit the tag policy in the Lambda environment variable `TAG_POLICY`:
+Set your required tags via the `TAG_POLICY` environment variable on the Lambda functions:
 
 ```json
 {
   "Owner": {"required": true},
-  "Environment": {"required": true, "allowed_values": ["prod", "staging", "dev"]},
+  "Environment": {"required": true, "allowed_values": ["prod", "staging", "dev", "sandbox"]},
   "CostCenter": {"required": true},
   "Application": {"required": true}
 }
@@ -95,16 +90,11 @@ Edit the tag policy in the Lambda environment variable `TAG_POLICY`:
 
 ## Cost
 
-~$1-5 per account scan. Bedrock is only invoked for resources that fail deterministic tiers.
+~$1-5 per account scan. Bedrock Batch is 50% cheaper than real-time invocation.
 
 ## Limitations
 
 - CloudTrail Tier 2 limited to 90-day default retention
-- Business context tags (Compliance, SLA) require human knowledge — AI won't guess
-- Shared resources (NAT GW, TGW) flagged as ambiguous, not force-tagged
+- Business context tags (Compliance, SLA) require human knowledge
+- Shared resources (NAT GW, TGW) flagged as ambiguous
 - Max 50 user tags per resource — checked before recommending
-- Not all resource types support the Tagging API
-
-## Multi-Account Deployment
-
-Deploy as a CloudFormation StackSet across your Organization. Each account gets its own scan, results go to a central S3 bucket.
