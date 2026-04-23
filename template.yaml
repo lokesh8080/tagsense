@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'TagSense v2 — Distributed Map + Bedrock Batch'
+
+Parameters:
+  DeployBucket:
+    Type: String
+  BedrockModelId:
+    Type: String
+    Default: 'us.anthropic.claude-haiku-4-5-20251001-v1:0'
+  NotificationEmail:
+    Type: String
+    Default: ''
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'tagsense-results-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: Expire
+            Status: Enabled
+            ExpirationInDays: 90
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasEmail
+
+  NotificationSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # --- IAM ---
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TagSenseLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TagSense
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - tag:GetResources
+                  - tag:TagResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResources
+                  - cloudtrail:LookupEvents
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - cloudwatch:GetMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:GetModelInvocationJob
+                  - bedrock:ListModelInvocationJobs
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub '${ResultsBucket.Arn}'
+                  - !Sub '${ResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+
+  BedrockBatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TagSenseBedrockBatchRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockBatchS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub '${ResultsBucket.Arn}'
+                  - !Sub '${ResultsBucket.Arn}/*'
+
+  # --- Lambda Functions ---
+  DiscoveryFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-discovery
+      Runtime: python3.12
+      Handler: discovery.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/discovery.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          SNS_TOPIC_ARN: !If [HasEmail, !Ref NotificationTopic, '']
+
+  InferenceWorkerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-inference-worker
+      Runtime: python3.12
+      Handler: inference_worker.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/inference_worker.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+
+  AggregatorFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-aggregator
+      Runtime: python3.12
+      Handler: aggregator.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/aggregator.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+
+  BedrockBatchFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-bedrock-batch
+      Runtime: python3.12
+      Handler: bedrock_batch.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/bedrock_batch.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+
+  BedrockPollerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-bedrock-poller
+      Runtime: python3.12
+      Handler: bedrock_poller.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/bedrock_poller.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+
+  ReportFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-report
+      Runtime: python3.12
+      Handler: report.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/report.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+          SNS_TOPIC_ARN: !If [HasEmail, !Ref NotificationTopic, '']
+
+  ApplyFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-apply
+      Runtime: python3.12
+      Handler: apply.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/apply.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+
+  EnforceFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: tagsense-enforce
+      Runtime: python3.12
+      Handler: enforce.handler
+      Code: {S3Bucket: !Ref DeployBucket, S3Key: lambdas/enforce.zip}
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: tagsense
+
+  # --- Step Functions ---
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: tagsense-pipeline-v2
+      RoleArn: !GetAtt SfnRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "TagSense v2 — Distributed Map + Bedrock Batch",
+          "StartAt": "Discovery",
+          "States": {
+            "Discovery": {
+              "Type": "Task",
+              "Resource": "${DiscoveryFn.Arn}",
+              "ResultPath": "$.discovery",
+              "Next": "HasGaps"
+            },
+            "HasGaps": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.discovery.non_compliant_count", "NumericGreaterThan": 0, "Next": "InferTiers123"}],
+              "Default": "Done"
+            },
+            "InferTiers123": {
+              "Type": "Map",
+              "ItemProcessor": {
+                "ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                "StartAt": "ProcessBatch",
+                "States": {
+                  "ProcessBatch": {
+                    "Type": "Task",
+                    "Resource": "${InferenceWorkerFn.Arn}",
+                    "End": true
+                  }
+                }
+              },
+              "ItemReader": {
+                "Resource": "arn:aws:states:::s3:getObject",
+                "ReaderConfig": {"InputType": "JSONL", "MaxItems": 10000},
+                "Parameters": {
+                  "Bucket.$": "$.discovery.items_s3.Bucket",
+                  "Key.$": "$.discovery.items_s3.Key"
+                }
+              },
+              "ItemBatcher": {"MaxItemsPerBatch": 20},
+              "MaxConcurrency": 40,
+              "ToleratedFailurePercentage": 5,
+              "ResultWriter": {
+                "Resource": "arn:aws:states:::s3:putObject",
+                "Parameters": {
+                  "Bucket": "${ResultsBucket}",
+                  "Prefix.$": "States.Format('tagsense/{}/map_output', $.discovery.run_id)"
+                }
+              },
+              "ResultPath": "$.map_result",
+              "Next": "Aggregate"
+            },
+            "Aggregate": {
+              "Type": "Task",
+              "Resource": "${AggregatorFn.Arn}",
+              "Parameters": {
+                "run_id.$": "$.discovery.run_id",
+                "region.$": "$.discovery.region"
+              },
+              "ResultPath": "$.aggregation",
+              "Next": "CheckBedrockNeeded"
+            },
+            "CheckBedrockNeeded": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.aggregation.needs_bedrock", "NumericGreaterThan": 0, "Next": "SubmitBedrockBatch"}],
+              "Default": "SkipBedrock"
+            },
+            "SubmitBedrockBatch": {
+              "Type": "Task",
+              "Resource": "${BedrockBatchFn.Arn}",
+              "Parameters": {
+                "run_id.$": "$.discovery.run_id",
+                "region.$": "$.discovery.region",
+                "bedrock_role_arn": "${BedrockBatchRole.Arn}"
+              },
+              "ResultPath": "$.bedrock",
+              "Next": "WaitForBedrock"
+            },
+            "WaitForBedrock": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "PollBedrock"
+            },
+            "PollBedrock": {
+              "Type": "Task",
+              "Resource": "${BedrockPollerFn.Arn}",
+              "Parameters": {
+                "run_id.$": "$.discovery.run_id",
+                "region.$": "$.discovery.region",
+                "batch_job_arn.$": "$.bedrock.batch_job_arn"
+              },
+              "ResultPath": "$.poll",
+              "Next": "IsBatchDone"
+            },
+            "IsBatchDone": {
+              "Type": "Choice",
+              "Choices": [{"Variable": "$.poll.status", "StringEquals": "Completed", "Next": "Report"}],
+              "Default": "WaitForBedrock"
+            },
+            "SkipBedrock": {
+              "Type": "Task",
+              "Resource": "${BedrockBatchFn.Arn}",
+              "Comment": "No Bedrock needed — just write final results",
+              "Parameters": {
+                "run_id.$": "$.discovery.run_id",
+                "region.$": "$.discovery.region",
+                "bedrock_role_arn": "${BedrockBatchRole.Arn}"
+              },
+              "ResultPath": "$.bedrock",
+              "Next": "Report"
+            },
+            "Report": {
+              "Type": "Task",
+              "Resource": "${ReportFn.Arn}",
+              "Parameters": {"run_id.$": "$.discovery.run_id", "region.$": "$.discovery.region"},
+              "ResultPath": "$.report",
+              "Next": "Enforce"
+            },
+            "Enforce": {
+              "Type": "Task",
+              "Resource": "${EnforceFn.Arn}",
+              "Parameters": {"run_id.$": "$.discovery.run_id", "region.$": "$.discovery.region"},
+              "ResultPath": "$.enforcement",
+              "End": true
+            },
+            "Done": {"Type": "Succeed"}
+          }
+        }
+
+  SfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TagSenseSfnRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TagSenseSfn
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DiscoveryFn.Arn
+                  - !GetAtt InferenceWorkerFn.Arn
+                  - !GetAtt AggregatorFn.Arn
+                  - !GetAtt BedrockBatchFn.Arn
+                  - !GetAtt BedrockPollerFn.Arn
+                  - !GetAtt ReportFn.Arn
+                  - !GetAtt ApplyFn.Arn
+                  - !GetAtt EnforceFn.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub '${ResultsBucket.Arn}'
+                  - !Sub '${ResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: '*'
+
+Outputs:
+  StateMachineArn:
+    Value: !GetAtt StateMachine.Arn
+  ResultsBucket:
+    Value: !Ref ResultsBucket
+  ApplyFnArn:
+    Value: !GetAtt ApplyFn.Arn
+  BedrockBatchRoleArn:
+    Value: !GetAtt BedrockBatchRole.Arn
